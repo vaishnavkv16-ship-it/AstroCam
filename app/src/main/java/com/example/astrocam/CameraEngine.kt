@@ -12,8 +12,11 @@ import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.ColorSpaceTransform
+import android.hardware.camera2.params.RggbChannelVector
 import android.media.ExifInterface
 import android.media.Image
 import android.media.ImageReader
@@ -21,15 +24,20 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.util.Range
 import android.util.Size
+import android.util.SizeF
 import android.view.Surface
 import android.view.TextureView
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
+import kotlin.math.ln
+import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
@@ -67,6 +75,20 @@ class CameraEngine(private val activity: Activity, private val listener: Listene
         private set
     var sensorOrientation = 90
         private set
+    var manualWb = false
+        private set
+    var rawSize: Size? = null
+        private set
+    var jpegSize: Size? = null
+        private set
+    var sensorSize: SizeF? = null
+        private set
+    var hwLevel = -1
+        private set
+    var focalMm = 0
+        private set
+
+    @Volatile private var lastTransform: ColorSpaceTransform? = null
 
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
@@ -90,6 +112,12 @@ class CameraEngine(private val activity: Activity, private val listener: Listene
     private var curType = FrameType.LIGHT
     private var curWantRaw = true
     private var curWantJpeg = false
+    private var curTree = ""
+    private var curBaseDir = "Pictures"
+    private var curFolderSegs: List<String> = listOf("AstroCam")
+    private var curSubParts: List<String> = emptyList()
+    private var curTarget = ""
+    private val dirCache = HashMap<String, Uri>()
 
     init {
         try {
@@ -158,6 +186,14 @@ class CameraEngine(private val activity: Activity, private val listener: Listene
             hyperfocalDiopter = c.get(CameraCharacteristics.LENS_INFO_HYPERFOCAL_DISTANCE) ?: 0f
             awbModes = c.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)?.toList() ?: listOf(1)
             sensorOrientation = c.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+            manualWb = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING) == true
+            sensorSize = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            hwLevel = c.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL) ?: -1
+            focalMm = equivMm(c) ?: 0
+            rawSize = null
+            jpegSize = null
+            lastTransform = null
 
             val map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             if (map == null) {
@@ -182,6 +218,7 @@ class CameraEngine(private val activity: Activity, private val listener: Listene
                     listener.onError("RAW is not available on this lens")
                     return
                 }
+                rawSize = rs
                 rawReader = ImageReader.newInstance(rs.width, rs.height, ImageFormat.RAW_SENSOR, 3).also {
                     it.setOnImageAvailableListener({ r -> onRawImage(r) }, handler)
                 }
@@ -192,6 +229,7 @@ class CameraEngine(private val activity: Activity, private val listener: Listene
                     listener.onError("JPEG is not available on this lens")
                     return
                 }
+                jpegSize = js
                 jpegReader = ImageReader.newInstance(js.width, js.height, ImageFormat.JPEG, 3).also {
                     it.setOnImageAvailableListener({ r -> onJpegImage(r) }, handler)
                 }
@@ -277,10 +315,17 @@ class CameraEngine(private val activity: Activity, private val listener: Listene
 
     private fun applySettings(b: CaptureRequest.Builder, s: Settings, preview: Boolean) {
         b.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-        b.set(
-            CaptureRequest.CONTROL_AWB_MODE,
-            if (awbModes.contains(s.awb)) s.awb else CaptureRequest.CONTROL_AWB_MODE_AUTO
-        )
+        if (s.awb == 0 && manualWb) {
+            b.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
+            b.set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+            b.set(CaptureRequest.COLOR_CORRECTION_GAINS, kelvinGains(s.kelvin))
+            b.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, lastTransform ?: identityTransform())
+        } else {
+            b.set(
+                CaptureRequest.CONTROL_AWB_MODE,
+                if (s.awb != 0 && awbModes.contains(s.awb)) s.awb else CaptureRequest.CONTROL_AWB_MODE_AUTO
+            )
+        }
 
         val bias = !preview && s.frameType == FrameType.BIAS
         if (s.autoExposure && !bias) {
@@ -325,6 +370,23 @@ class CameraEngine(private val activity: Activity, private val listener: Listene
         }
     }
 
+    private fun identityTransform(): ColorSpaceTransform =
+        ColorSpaceTransform(intArrayOf(1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1))
+
+    /** Approximate white balance gains for a light of the given colour temperature. */
+    private fun kelvinGains(k: Int): RggbChannelVector {
+        val t = k.coerceIn(1500, 12000) / 100.0
+        val r = if (t <= 66.0) 255.0 else 329.698727446 * (t - 60.0).pow(-0.1332047592)
+        val g = if (t <= 66.0) 99.4708025861 * ln(t) - 161.1195681661 else 288.1221695283 * (t - 60.0).pow(-0.0755148492)
+        val b = if (t >= 66.0) 255.0 else if (t <= 19.0) 1.0 else 138.5177312231 * ln(t - 10.0) - 305.0447927307
+        val rr = max(1.0, min(255.0, r))
+        val gg = max(1.0, min(255.0, g))
+        val bb = max(1.0, min(255.0, b))
+        val gainR = (gg / rr).coerceIn(0.4, 6.0).toFloat()
+        val gainB = (gg / bb).coerceIn(0.4, 6.0).toFloat()
+        return RggbChannelVector(gainR, 1f, 1f, gainB)
+    }
+
     fun applyPreview(s: Settings) {
         val cam = camera ?: return
         val ss = session ?: return
@@ -333,7 +395,18 @@ class CameraEngine(private val activity: Activity, private val listener: Listene
             val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             b.addTarget(surface)
             applySettings(b, s, true)
-            ss.setRepeatingRequest(b.build(), null, handler)
+            val cb = object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    result: TotalCaptureResult
+                ) {
+                    if (s.awb != 0) {
+                        result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { lastTransform = it }
+                    }
+                }
+            }
+            ss.setRepeatingRequest(b.build(), cb, handler)
         } catch (e: Exception) {
             listener.onMessage("Preview: ${e.message}")
         }
@@ -359,6 +432,16 @@ class CameraEngine(private val activity: Activity, private val listener: Listene
             curType = s.frameType
             curWantRaw = wantRaw
             curWantJpeg = wantJpeg
+            curTree = s.treeUri
+            curBaseDir = if (s.baseDir == "DCIM") "DCIM" else "Pictures"
+            val folder = cleanSegments(s.folderName)
+            curFolderSegs = if (folder.isEmpty()) listOf("AstroCam") else folder
+            curTarget = cleanSegments(s.targetName).joinToString("_")
+            val sub = ArrayList<String>()
+            if (s.sessionFolder) sub.add((if (curTarget.isEmpty()) "Session" else curTarget) + "_" + stamp)
+            if (s.typeFolders) sub.add(s.frameType.prefix)
+            curSubParts = sub
+            if (index == 1) dirCache.clear()
         }
         try {
             val b = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
@@ -424,13 +507,14 @@ class CameraEngine(private val activity: Activity, private val listener: Listene
         val result = taken.first
         val rawImg = taken.second
         val jpgImg = taken.third
-        val base = "${curType.prefix}_${curStamp}_${"%03d".format(curIndex)}"
+        val base = (if (curTarget.isEmpty()) "" else curTarget + "_") +
+            "${curType.prefix}_${curStamp}_${"%03d".format(curIndex)}"
         var lastPath = ""
         try {
             if (rawImg != null) {
                 val dng = DngCreator(chars!!, result)
                 dng.setOrientation(exifOrientation())
-                val out = openOut("$base.dng", "image/x-adobe-dng", curType.prefix)
+                val out = openOut("$base.dng", "image/x-adobe-dng")
                 try {
                     dng.writeImage(out.stream, rawImg)
                 } finally {
@@ -443,7 +527,7 @@ class CameraEngine(private val activity: Activity, private val listener: Listene
                 val buf = jpgImg.planes[0].buffer
                 val bytes = ByteArray(buf.remaining())
                 buf.get(bytes)
-                val out = openOut("$base.jpg", "image/jpeg", curType.prefix)
+                val out = openOut("$base.jpg", "image/jpeg")
                 try {
                     out.stream.write(bytes)
                 } finally {
@@ -471,27 +555,84 @@ class CameraEngine(private val activity: Activity, private val listener: Listene
 
     private class Out(val stream: OutputStream, val uri: Uri?, val path: String)
 
-    /** Android 10+: saved to Pictures/AstroCam/<type> so they show in the gallery. Older: app folder. */
-    private fun openOut(name: String, mime: String, sub: String): Out {
+    private fun cleanSegments(raw: String): List<String> =
+        raw.split("/")
+            .map { it.replace(Regex("[\\\\:*?\"<>|]"), "_").trim() }
+            .filter { it.isNotEmpty() && it != "." && it != ".." }
+
+    private fun findOrCreateDir(tree: Uri, parent: Uri, name: String): Uri {
+        val cr = activity.contentResolver
+        val parentId = DocumentsContract.getDocumentId(parent)
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentId)
+        val cols = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE
+        )
+        cr.query(children, cols, null, null, null)?.use { c ->
+            while (c.moveToNext()) {
+                if (c.getString(1) == name && c.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR) {
+                    return DocumentsContract.buildDocumentUriUsingTree(tree, c.getString(0))
+                }
+            }
+        }
+        return DocumentsContract.createDocument(cr, parent, DocumentsContract.Document.MIME_TYPE_DIR, name)
+            ?: throw IllegalStateException("Cannot create folder $name")
+    }
+
+    /**
+     * Folder chosen in Settings (any location), else Pictures/<folder> or DCIM/<folder>
+     * (shows in the gallery), else the app's own folder.
+     */
+    private fun openOut(name: String, mime: String): Out {
+        val cr = activity.contentResolver
+        if (curTree.isNotEmpty()) {
+            try {
+                val tree = Uri.parse(curTree)
+                var dir = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
+                var key = curTree
+                for (part in curSubParts) {
+                    key += "/$part"
+                    val cached = dirCache[key]
+                    if (cached != null) {
+                        dir = cached
+                    } else {
+                        dir = findOrCreateDir(tree, dir, part)
+                        dirCache[key] = dir
+                    }
+                }
+                val fileUri = DocumentsContract.createDocument(cr, dir, mime, name)
+                if (fileUri != null) {
+                    val st = cr.openOutputStream(fileUri)
+                    if (st != null) {
+                        val shown = (listOf("<your folder>") + curSubParts).joinToString("/")
+                        return Out(st, null, "$shown/$name")
+                    }
+                }
+            } catch (e: Exception) {
+                // fall back to the default folder below
+            }
+        }
+        val parts = curFolderSegs + curSubParts
         if (Build.VERSION.SDK_INT >= 29) {
             try {
-                val rel = "Pictures/AstroCam/$sub"
+                val rel = curBaseDir + "/" + parts.joinToString("/")
                 val v = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, name)
                     put(MediaStore.MediaColumns.MIME_TYPE, mime)
                     put(MediaStore.MediaColumns.RELATIVE_PATH, rel)
                     put(MediaStore.MediaColumns.IS_PENDING, 1)
                 }
-                val uri = activity.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v)
+                val uri = cr.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v)
                 if (uri != null) {
-                    val st = activity.contentResolver.openOutputStream(uri)
+                    val st = cr.openOutputStream(uri)
                     if (st != null) return Out(st, uri, "$rel/$name")
                 }
             } catch (e: Exception) {
                 // fall back to the app folder below
             }
         }
-        val dir = File(activity.getExternalFilesDir(null), "AstroCam/$sub")
+        val dir = File(activity.getExternalFilesDir(null), "AstroCam/" + parts.joinToString("/"))
         dir.mkdirs()
         val f = File(dir, name)
         return Out(FileOutputStream(f), null, f.absolutePath)
