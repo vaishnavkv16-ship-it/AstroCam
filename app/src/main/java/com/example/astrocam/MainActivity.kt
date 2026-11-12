@@ -3,6 +3,8 @@ package com.example.astrocam
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.Dialog
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Canvas
@@ -15,6 +17,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
 import android.media.ToneGenerator
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -28,6 +31,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
@@ -53,15 +57,15 @@ class GridOverlay(ctx: android.content.Context) : View(ctx) {
         invalidate()
     }
 
-    override fun onDraw(c: Canvas) {
+    override fun onDraw(canvas: Canvas) {
         val w = width.toFloat()
         val h = height.toFloat()
         for (i in 1..2) {
-            c.drawLine(w * i / 3f, 0f, w * i / 3f, h, p)
-            c.drawLine(0f, h * i / 3f, w, h * i / 3f, p)
+            canvas.drawLine(w * i / 3f, 0f, w * i / 3f, h, p)
+            canvas.drawLine(0f, h * i / 3f, w, h * i / 3f, p)
         }
-        c.drawLine(w / 2f - 30f, h / 2f, w / 2f + 30f, h / 2f, p)
-        c.drawLine(w / 2f, h / 2f - 30f, w / 2f, h / 2f + 30f, p)
+        canvas.drawLine(w / 2f - 30f, h / 2f, w / 2f + 30f, h / 2f, p)
+        canvas.drawLine(w / 2f, h / 2f - 30f, w / 2f, h / 2f + 30f, p)
     }
 }
 
@@ -76,6 +80,8 @@ class MainActivity : Activity(), CameraEngine.Listener {
         Preset("Meteor shower  (ISO 1600, 10 s, until stopped)", 1600, 10_000_000_000L, 0),
         Preset("Moon  (ISO 100, 1/250 s)", 100, 4_000_000L, 1)
     )
+
+    private val REQ_TREE = 77
 
     private val s = Settings()
     private lateinit var engine: CameraEngine
@@ -93,9 +99,12 @@ class MainActivity : Activity(), CameraEngine.Listener {
     private lateinit var statusText: TextView
     private lateinit var infoText: TextView
     private lateinit var formatText: TextView
+    private lateinit var overlay: TextView
     private lateinit var lensBtn: TextView
     private lateinit var shutterBtn: TextView
     private val chips = HashMap<Panel, Pair<LinearLayout, TextView>>()
+
+    private var settingsRefresh: (() -> Unit)? = null
 
     private var engineReady = false
     private var opening = false
@@ -152,6 +161,26 @@ class MainActivity : Activity(), CameraEngine.Listener {
             openIfReady()
         } else {
             setStatus("Camera permission is needed. Allow it in phone Settings > Apps > AstroCam.")
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_TREE && resultCode == RESULT_OK) {
+            val uri = data?.data ?: return
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            } catch (e: Exception) {
+                // permission may already be granted
+            }
+            s.treeUri = uri.toString()
+            s.save(this)
+            settingsRefresh?.invoke()
+            refreshInfo()
         }
     }
 
@@ -230,10 +259,13 @@ class MainActivity : Activity(), CameraEngine.Listener {
         s.expNs = s.expNs.coerceIn(engine.expRange.lower, engine.expRange.upper)
         s.ev = s.ev.coerceIn(engine.evRange.lower, engine.evRange.upper)
         s.focusDiopter = s.focusDiopter.coerceIn(0f, max(engine.minFocusDiopter, 0f))
-        if (!engine.awbModes.contains(s.awb)) s.awb = 1
+        s.kelvin = s.kelvin.coerceIn(2000, 10000)
+        val badCustom = s.awb == 0 && !engine.manualWb
+        val badPreset = s.awb != 0 && !engine.awbModes.contains(s.awb)
+        if (badCustom || badPreset) s.awb = 1
     }
 
-    // ---------------------------------------------------------------- UI building
+    // ---------------------------------------------------------------- UI helpers
 
     private fun round(fill: Int, stroke: Int, radius: Int): GradientDrawable =
         GradientDrawable().apply {
@@ -278,6 +310,18 @@ class MainActivity : Activity(), CameraEngine.Listener {
         return hscroll(row)
     }
 
+    /** Row of small fine-adjust buttons, e.g. "- 1/3 stop" and "+ 1/3 stop". */
+    private fun stepper(items: List<Pair<String, () -> Unit>>): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        for ((label, act) in items) {
+            row.addView(pill(label, false) { act() }, lp(WRAP, WRAP, 0f, dp(4), dp(4), dp(4), dp(2)))
+        }
+        return hscroll(row)
+    }
+
     private fun slider(maxValue: Int, progressValue: Int, onChange: (Int) -> Unit): SeekBar =
         SeekBar(this).apply {
             max = maxValue
@@ -295,6 +339,18 @@ class MainActivity : Activity(), CameraEngine.Listener {
             })
         }
 
+    private fun note(t: String): TextView = text(t, 12f, dimColor).apply { setPadding(0, dp(4), 0, dp(2)) }
+
+    private fun setStatus(msg: String) {
+        runOnUiThread { if (::statusText.isInitialized) statusText.text = msg }
+    }
+
+    private fun toast(msg: String) {
+        runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+    }
+
+    // ---------------------------------------------------------------- Main screen
+
     private fun buildUi() {
         applyBrightness()
         chips.clear()
@@ -303,7 +359,6 @@ class MainActivity : Activity(), CameraEngine.Listener {
             setBackgroundColor(Color.BLACK)
         }
 
-        // Top bar
         val top = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -319,7 +374,6 @@ class MainActivity : Activity(), CameraEngine.Listener {
         top.addView(setBtn, lp(WRAP, WRAP))
         root.addView(top, lp(MATCH, WRAP))
 
-        // Preview
         previewBox = FrameLayout(this)
         tv = TextureView(this)
         if (s.night) {
@@ -338,11 +392,16 @@ class MainActivity : Activity(), CameraEngine.Listener {
         grid = GridOverlay(this)
         grid.setLineColor(if (s.night) Color.argb(120, 255, 60, 60) else Color.argb(140, 255, 255, 255))
         grid.visibility = if (s.grid) View.VISIBLE else View.GONE
+        overlay = text("", 11f, fg).apply {
+            setShadowLayer(4f, 0f, 0f, Color.BLACK)
+            setPadding(dp(10), dp(8), dp(10), 0)
+            visibility = if (s.showInfo) View.VISIBLE else View.GONE
+        }
         previewBox.addView(tv, FrameLayout.LayoutParams(MATCH, MATCH, Gravity.CENTER))
         previewBox.addView(grid, FrameLayout.LayoutParams(MATCH, MATCH, Gravity.CENTER))
+        previewBox.addView(overlay, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.START))
         root.addView(previewBox, lp(MATCH, 0, 1f))
 
-        // Panel
         panelBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(10), dp(8), dp(10), dp(8))
@@ -351,7 +410,6 @@ class MainActivity : Activity(), CameraEngine.Listener {
         }
         root.addView(panelBox, lp(MATCH, WRAP, 0f, dp(8), dp(6), dp(8), 0))
 
-        // Chips
         val chipRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val labels = listOf(
             Panel.MODE to "MODE", Panel.ISO to "ISO", Panel.SHUTTER to "SHUTTER", Panel.FOCUS to "FOCUS",
@@ -360,7 +418,6 @@ class MainActivity : Activity(), CameraEngine.Listener {
         for ((p, l) in labels) chipRow.addView(makeChip(p, l), lp(WRAP, WRAP, 0f, dp(4), 0, dp(4), 0))
         root.addView(hscroll(chipRow), lp(MATCH, WRAP, 0f, dp(4), dp(8), dp(4), dp(4)))
 
-        // Bottom row
         infoText = text("", 11f, dimColor)
         formatText = text("", 11f, dimColor).apply { gravity = Gravity.END }
         shutterBtn = TextView(this).apply {
@@ -416,7 +473,6 @@ class MainActivity : Activity(), CameraEngine.Listener {
             val cw = previewBox.width
             val ch = previewBox.height
             if (cw == 0 || ch == 0) return@post
-            // Phone is held upright, so the sensor's long side runs vertically.
             var vw = cw
             var vh = (cw.toFloat() * pw / ph).toInt()
             if (vh > ch) {
@@ -429,14 +485,6 @@ class MainActivity : Activity(), CameraEngine.Listener {
     }
 
     // ---------------------------------------------------------------- Refreshing
-
-    private fun setStatus(msg: String) {
-        runOnUiThread { if (::statusText.isInitialized) statusText.text = msg }
-    }
-
-    private fun toast(msg: String) {
-        runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
-    }
 
     private fun refreshAll() {
         if (!::lensBtn.isInitialized) return
@@ -453,6 +501,15 @@ class MainActivity : Activity(), CameraEngine.Listener {
         return if (d < 0.05f) "\u221E" else "%.2f m".format(1f / d)
     }
 
+    private fun focusShort(): String = when (s.focusMode) {
+        FocusMode.INFINITY -> "\u221E"
+        FocusMode.HYPERFOCAL -> "HYPER"
+        FocusMode.MANUAL -> focusLabel()
+        FocusMode.AUTO -> "AUTO"
+    }
+
+    private fun wbShort(): String = if (s.awb == 0) "${s.kelvin}K" else awbName(s.awb)
+
     private fun refreshChips() {
         fun setChip(p: Panel, v: String) {
             val c = chips[p] ?: return
@@ -463,18 +520,44 @@ class MainActivity : Activity(), CameraEngine.Listener {
         setChip(Panel.MODE, if (s.autoExposure) "AUTO" else "MANUAL")
         setChip(Panel.ISO, if (s.autoExposure) "AUTO" else s.iso.toString())
         setChip(Panel.SHUTTER, if (s.autoExposure) "AUTO" else fmtShutter(s.expNs))
-        setChip(
-            Panel.FOCUS, when (s.focusMode) {
-                FocusMode.INFINITY -> "\u221E"
-                FocusMode.HYPERFOCAL -> "HYPER"
-                FocusMode.MANUAL -> focusLabel()
-                FocusMode.AUTO -> "AUTO"
-            }
-        )
-        setChip(Panel.WB, awbName(s.awb))
+        setChip(Panel.FOCUS, focusShort())
+        setChip(Panel.WB, wbShort())
         setChip(Panel.TYPE, s.frameType.label)
         setChip(Panel.FRAMES, if (s.frames == 0) "\u221E" else s.frames.toString())
         setChip(Panel.TIMER, "${s.countdownSec}s / ${s.intervalSec}s")
+        refreshOverlay()
+    }
+
+    private fun refreshOverlay() {
+        if (!::overlay.isInitialized) return
+        overlay.setTextColor(fg)
+        val lens = engine.lenses.getOrNull(s.lensIndex)?.label ?: "-"
+        val size = engine.rawSize ?: engine.jpegSize
+        val res = if (size != null) "  ${size.width}x${size.height}" else ""
+        val exp = if (s.autoExposure) "AUTO exposure" else "ISO ${s.iso}  ${fmtShutter(s.expNs)}"
+        overlay.text = "$lens  ${formatName()}$res\n$exp  focus ${focusShort()}  WB ${wbShort()}\n${s.frameType.label}"
+    }
+
+    private fun frameMb(): Double {
+        var mb = 0.0
+        val r = engine.rawSize
+        val j = engine.jpegSize
+        if (s.raw && r != null) mb += r.width.toDouble() * r.height * 2.0 / 1e6
+        if (s.jpeg && j != null) mb += j.width.toDouble() * j.height * 0.35 / 1e6
+        return mb
+    }
+
+    private fun pathHint(): String {
+        val parts = ArrayList<String>()
+        if (s.treeUri.isNotEmpty()) {
+            parts.add("<your folder>")
+        } else {
+            parts.add(s.baseDir)
+            parts.add(if (s.folderName.isBlank()) "AstroCam" else s.folderName.trim())
+        }
+        if (s.sessionFolder) parts.add("<target>_<date>")
+        if (s.typeFolders) parts.add(s.frameType.prefix)
+        return parts.joinToString("/")
     }
 
     private fun refreshInfo() {
@@ -521,6 +604,7 @@ class MainActivity : Activity(), CameraEngine.Listener {
     }
 
     private fun awbName(m: Int): String = when (m) {
+        0 -> "CUSTOM"
         1 -> "AUTO"
         2 -> "TUNGSTEN"
         3 -> "FLUOR"
@@ -588,8 +672,6 @@ class MainActivity : Activity(), CameraEngine.Listener {
         refreshChips()
     }
 
-    private fun note(t: String): TextView = text(t, 12f, dimColor).apply { setPadding(0, dp(4), 0, dp(2)) }
-
     private fun buildModePanel() {
         panelBox.addView(choiceRow(listOf("Manual", "Auto"), if (s.autoExposure) 1 else 0) {
             s.autoExposure = it == 1
@@ -615,6 +697,20 @@ class MainActivity : Activity(), CameraEngine.Listener {
             upd()
             applyAndRefresh()
         })
+        panelBox.addView(stepper(listOf(
+            "\u2212 EV" to { s.ev = (s.ev - 1).coerceIn(lo, hi); applyAndRefresh(); showPanel(Panel.MODE) },
+            "+ EV" to { s.ev = (s.ev + 1).coerceIn(lo, hi); applyAndRefresh(); showPanel(Panel.MODE) }
+        )))
+    }
+
+    private fun stepIso(dir: Int) {
+        val lo = engine.isoRange.lower
+        val hi = engine.isoRange.upper
+        var n = (s.iso * 2.0.pow(dir / 3.0)).roundToInt()
+        if (n == s.iso) n += dir
+        s.iso = n.coerceIn(lo, hi)
+        applyAndRefresh()
+        showPanel(Panel.ISO)
     }
 
     private fun buildIsoPanel() {
@@ -649,7 +745,11 @@ class MainActivity : Activity(), CameraEngine.Listener {
             upd()
             applyAndRefresh()
         })
-        panelBox.addView(note("Higher ISO = brighter but noisier."))
+        panelBox.addView(stepper(listOf(
+            "\u2212 1/3 stop" to { stepIso(-1) },
+            "+ 1/3 stop" to { stepIso(1) }
+        )))
+        panelBox.addView(note("Range $lo - $hi. Higher ISO = brighter but noisier."))
     }
 
     private fun parseShutter(t: String): Long? {
@@ -666,6 +766,16 @@ class MainActivity : Activity(), CameraEngine.Listener {
         }
     }
 
+    private fun stepShutter(dir: Int) {
+        val lo = engine.expRange.lower
+        val hi = engine.expRange.upper
+        var n = (s.expNs * 2.0.pow(dir / 3.0)).toLong()
+        if (n == s.expNs) n += dir
+        s.expNs = n.coerceIn(lo, hi)
+        applyAndRefresh()
+        showPanel(Panel.SHUTTER)
+    }
+
     private fun buildShutterPanel() {
         if (s.autoExposure) {
             panelBox.addView(note("Exposure is AUTO. Set MODE to Manual to choose the shutter."))
@@ -674,10 +784,10 @@ class MainActivity : Activity(), CameraEngine.Listener {
         val lo = engine.expRange.lower
         val hi = engine.expRange.upper
         val valueView = text("", 16f, fg, true)
-        fun upd() { valueView.text = "Shutter ${fmtShutter(s.expNs)}   (tap to type, e.g. 1/250 or 20)" }
+        fun upd() { valueView.text = "Shutter ${fmtShutter(s.expNs)}   (tap to type)" }
         upd()
         valueView.setOnClickListener {
-            prompt("Shutter (1/250 or seconds)", fmtShutter(s.expNs).removeSuffix("s"), InputType.TYPE_CLASS_TEXT) { t ->
+            prompt("Shutter: type 1/250 or seconds like 20", fmtShutter(s.expNs).removeSuffix("s"), InputType.TYPE_CLASS_TEXT) { t ->
                 val n = parseShutter(t)
                 if (n != null && n > 0) {
                     s.expNs = n.coerceIn(lo, hi)
@@ -702,7 +812,19 @@ class MainActivity : Activity(), CameraEngine.Listener {
             upd()
             applyAndRefresh()
         })
-        panelBox.addView(note("Live view shows a short boosted exposure for aiming. The saved photo uses the full time."))
+        panelBox.addView(stepper(listOf(
+            "\u2212 1/3 stop" to { stepShutter(-1) },
+            "+ 1/3 stop" to { stepShutter(1) }
+        )))
+        panelBox.addView(note("Range ${fmtShutter(lo)} - ${fmtShutter(hi)}. Live view shows a short boosted exposure; the saved photo uses the full time."))
+    }
+
+    private fun stepFocus(dir: Int) {
+        val minF = engine.minFocusDiopter
+        if (minF <= 0f) return
+        s.focusDiopter = (s.focusDiopter - dir * minF * 0.02f).coerceIn(0f, minF)
+        applyAndRefresh()
+        showPanel(Panel.FOCUS)
     }
 
     private fun buildFocusPanel() {
@@ -724,21 +846,59 @@ class MainActivity : Activity(), CameraEngine.Listener {
                     lbl.text = "Distance: ${focusLabel()}"
                     applyAndRefresh()
                 })
+                panelBox.addView(stepper(listOf(
+                    "\u25C0 nearer" to { stepFocus(-1) },
+                    "farther \u25B6" to { stepFocus(1) }
+                )))
                 panelBox.addView(note("Left = near, right = far. For stars, fine-tune on a bright star."))
             }
         } else if (s.focusMode == FocusMode.INFINITY) {
             panelBox.addView(note("Best for stars. If stars look soft, try Manual and move slightly left."))
+        } else if (s.focusMode == FocusMode.HYPERFOCAL) {
+            panelBox.addView(note("Everything from about half the hyperfocal distance to infinity is sharp."))
         }
     }
 
     private fun buildWbPanel() {
-        val modes = engine.awbModes
-        panelBox.addView(choiceRow(modes.map { awbName(it) }, modes.indexOf(s.awb)) {
-            s.awb = modes[it]
+        val opts = ArrayList<Int>(engine.awbModes.filter { it != 0 })
+        if (engine.manualWb) opts.add(0)
+        panelBox.addView(choiceRow(opts.map { if (it == 0) "Custom K" else awbName(it) }, opts.indexOf(s.awb)) {
+            s.awb = opts[it]
             applyAndRefresh()
             showPanel(Panel.WB)
         })
-        panelBox.addView(note("In RAW files white balance is only a tag, so you can change it later when editing."))
+        if (s.awb == 0 && engine.manualWb) {
+            val lbl = text("", 16f, fg, true)
+            fun upd() { lbl.text = "${s.kelvin} K   (tap to type)" }
+            upd()
+            lbl.setOnClickListener {
+                prompt("Colour temperature in Kelvin (2000 - 10000)", s.kelvin.toString(), InputType.TYPE_CLASS_NUMBER) { t ->
+                    val n = t.trim().toIntOrNull()
+                    if (n != null) {
+                        s.kelvin = n.coerceIn(2000, 10000)
+                        applyAndRefresh()
+                        showPanel(Panel.WB)
+                    }
+                }
+            }
+            panelBox.addView(lbl)
+            panelBox.addView(slider(80, (s.kelvin - 2000) / 100) { p ->
+                s.kelvin = 2000 + p * 100
+                upd()
+                applyAndRefresh()
+            })
+            panelBox.addView(stepper(listOf(
+                "\u2212 500 K" to { s.kelvin = (s.kelvin - 500).coerceIn(2000, 10000); applyAndRefresh(); showPanel(Panel.WB) },
+                "\u2212 100 K" to { s.kelvin = (s.kelvin - 100).coerceIn(2000, 10000); applyAndRefresh(); showPanel(Panel.WB) },
+                "+ 100 K" to { s.kelvin = (s.kelvin + 100).coerceIn(2000, 10000); applyAndRefresh(); showPanel(Panel.WB) },
+                "+ 500 K" to { s.kelvin = (s.kelvin + 500).coerceIn(2000, 10000); applyAndRefresh(); showPanel(Panel.WB) }
+            )))
+            panelBox.addView(note("Low K = warm light (compensates blue), high K = cool light. Approximate, mainly for preview and JPEG."))
+        } else if (!engine.manualWb) {
+            panelBox.addView(note("Custom Kelvin is not supported by this camera. Use the presets."))
+        } else {
+            panelBox.addView(note("In RAW files white balance is only a tag, so you can change it later when editing."))
+        }
     }
 
     private fun buildTypePanel() {
@@ -758,53 +918,52 @@ class MainActivity : Activity(), CameraEngine.Listener {
                 }
             )
         )
-        panelBox.addView(note("Files are saved in Pictures/AstroCam/${s.frameType.prefix}."))
+        panelBox.addView(note("Saved to: ${pathHint()}"))
+    }
+
+    private fun setFrames(n: Int) {
+        s.frames = n.coerceIn(0, 9999)
+        applyAndRefresh()
+        showPanel(Panel.FRAMES)
     }
 
     private fun buildFramesPanel() {
-        val values = listOf(1, 5, 10, 25, 50, 100, 0)
+        val values = listOf(1, 5, 10, 25, 50, 100, 200, 500, 0)
         panelBox.addView(choiceRow(values.map { if (it == 0) "\u221E" else "$it" }, values.indexOf(s.frames)) {
-            s.frames = values[it]
-            applyAndRefresh()
-            showPanel(Panel.FRAMES)
+            setFrames(values[it])
         })
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val minus = pill("\u2212", false) {
-            if (s.frames > 1) s.frames--
-            applyAndRefresh()
-            showPanel(Panel.FRAMES)
-        }
-        val plus = pill("+", false) {
-            if (s.frames != 0) s.frames++
-            applyAndRefresh()
-            showPanel(Panel.FRAMES)
-        }
         val value = text(if (s.frames == 0) "Until stopped" else "${s.frames} frames", 16f, fg, true).apply {
             gravity = Gravity.CENTER
+            setPadding(0, dp(6), 0, dp(2))
             setOnClickListener {
                 prompt("Number of frames (0 = until stopped)", s.frames.toString(), InputType.TYPE_CLASS_NUMBER) { t ->
                     val n = t.trim().toIntOrNull()
-                    if (n != null) {
-                        s.frames = n.coerceIn(0, 9999)
-                        applyAndRefresh()
-                        showPanel(Panel.FRAMES)
-                    }
+                    if (n != null) setFrames(n)
                 }
             }
         }
-        row.addView(minus, lp(WRAP, WRAP))
-        row.addView(value, lp(0, WRAP, 1f))
-        row.addView(plus, lp(WRAP, WRAP))
-        panelBox.addView(row, lp(MATCH, WRAP, 0f, 0, dp(6), 0, 0))
-        panelBox.addView(note("Tap the number to type it. Frames saved until you press stop or storage runs low."))
+        panelBox.addView(value, lp(MATCH, WRAP))
+        if (s.frames != 0) {
+            panelBox.addView(slider(1000, logPos(s.frames.toDouble().coerceAtLeast(1.0), 1.0, 500.0)) { p ->
+                s.frames = logVal(p, 1.0, 500.0).roundToInt().coerceIn(1, 500)
+                value.text = "${s.frames} frames"
+                applyAndRefresh()
+            })
+        }
+        panelBox.addView(stepper(listOf(
+            "\u2212 10" to { if (s.frames > 10) setFrames(s.frames - 10) else setFrames(1) },
+            "\u2212 1" to { if (s.frames > 1) setFrames(s.frames - 1) },
+            "+ 1" to { if (s.frames != 0) setFrames(s.frames + 1) },
+            "+ 10" to { if (s.frames != 0) setFrames(s.frames + 10) }
+        )))
+        val mb = frameMb()
+        val est = if (s.frames == 0 || mb <= 0.0) "" else "  Storage about %.1f GB.".format(s.frames * mb / 1000.0)
+        panelBox.addView(note("Tap the number to type any value. Choose \u221E to shoot until you press stop or storage runs low.$est"))
     }
 
     private fun buildTimerPanel() {
-        val cd = listOf(0, 2, 5, 10)
-        val iv = listOf(0, 1, 2, 5, 10)
+        val cd = listOf(0, 2, 5, 10, 30)
+        val iv = listOf(0, 1, 2, 5, 10, 30, 60)
         panelBox.addView(note("Countdown before the first frame"))
         panelBox.addView(choiceRow(cd.map { if (it == 0) "Off" else "$it s" }, cd.indexOf(s.countdownSec)) {
             s.countdownSec = cd[it]
@@ -817,6 +976,20 @@ class MainActivity : Activity(), CameraEngine.Listener {
             refreshChips()
             showPanel(Panel.TIMER)
         })
+        panelBox.addView(
+            pill("Type custom values", false) {
+                prompt("Countdown seconds", s.countdownSec.toString(), InputType.TYPE_CLASS_NUMBER) { a ->
+                    val c = a.trim().toIntOrNull()
+                    if (c != null) s.countdownSec = c.coerceIn(0, 600)
+                    prompt("Pause between frames (seconds)", s.intervalSec.toString(), InputType.TYPE_CLASS_NUMBER) { b ->
+                        val i = b.trim().toIntOrNull()
+                        if (i != null) s.intervalSec = i.coerceIn(0, 3600)
+                        refreshChips()
+                        showPanel(Panel.TIMER)
+                    }
+                }
+            }, lp(WRAP, WRAP, 0f, 0, dp(6), 0, 0)
+        )
     }
 
     // ---------------------------------------------------------------- Dialogs
@@ -856,66 +1029,262 @@ class MainActivity : Activity(), CameraEngine.Listener {
             .show()
     }
 
-    private fun openSettings() {
-        fun onOff(b: Boolean) = if (b) "ON" else "OFF"
-        val items = arrayOf(
-            "Night red mode: ${onOff(s.night)}",
-            "Grid: ${onOff(s.grid)}",
-            "Format: ${formatName()}",
-            "Help and tips"
-        )
-        AlertDialog.Builder(this)
-            .setTitle("Settings")
-            .setItems(items) { _, i ->
-                when (i) {
-                    0 -> {
-                        s.night = !s.night
-                        s.save(this)
-                        engineReady = false
-                        opening = false
-                        engine.close()
-                        buildUi()
-                    }
-                    1 -> {
-                        s.grid = !s.grid
-                        grid.visibility = if (s.grid) View.VISIBLE else View.GONE
-                        openSettings()
-                    }
-                    2 -> {
-                        if (running) {
-                            toast("Stop shooting first")
-                        } else {
-                            if (s.raw && !s.jpeg) {
-                                s.raw = false; s.jpeg = true
-                            } else if (!s.raw && s.jpeg) {
-                                s.raw = true; s.jpeg = true
-                            } else {
-                                s.raw = true; s.jpeg = false
-                            }
-                            refreshAll()
-                            reopenCamera()
-                        }
-                    }
-                    3 -> showHelp()
-                }
-            }
-            .show()
-    }
-
     private fun showHelp() {
         AlertDialog.Builder(this)
             .setTitle("Quick tips")
             .setMessage(
                 "1. Put the phone on a tripod or a stable surface.\n" +
                     "2. Tap PRESETS and pick a target (Milky Way, Moon...).\n" +
-                    "3. Check FOCUS is set to infinity. Tap a chip at the bottom to change any setting.\n" +
+                    "3. Check FOCUS is set to infinity. Tap a chip at the bottom to change any setting. " +
+                    "Every panel has presets, a slider, fine +/- buttons, and you can tap the value to type it.\n" +
                     "4. Use TIMER > Countdown 2-10 s so touching the phone does not shake it.\n" +
                     "5. Press the round button to start. Press it again to stop.\n\n" +
                     "For stacking later, also shoot some Dark, Flat and Bias frames (TYPE chip).\n\n" +
-                    "Files: Pictures/AstroCam/<type> in your gallery."
+                    "Choose where files go in the settings page (gear icon)."
             )
             .setPositiveButton("OK", null)
             .show()
+    }
+
+    // ---------------------------------------------------------------- Settings page
+
+    private fun sectionTitle(t: String): TextView =
+        text(t.uppercase(Locale.US), 12f, dimColor, true).apply { setPadding(0, dp(22), 0, dp(6)) }
+
+    private fun toggleRow(title: String, sub: String, on: Boolean, onChange: (Boolean) -> Unit): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col.addView(text(title, 15f))
+        if (sub.isNotEmpty()) col.addView(text(sub, 11f, dimColor))
+        row.addView(col, lp(0, WRAP, 1f))
+        row.addView(pill(if (on) "ON" else "OFF", on) { onChange(!on) })
+        return row
+    }
+
+    private fun valueRow(title: String, value: String, sub: String, onClick: () -> Unit): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+            setOnClickListener { onClick() }
+        }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col.addView(text(title, 15f))
+        if (sub.isNotEmpty()) col.addView(text(sub, 11f, dimColor))
+        row.addView(col, lp(0, WRAP, 1f))
+        row.addView(text(value, 14f, fg, true).apply { gravity = Gravity.END }, lp(WRAP, WRAP, 0f, dp(8), 0, 0, 0))
+        return row
+    }
+
+    private fun cameraDetails(): List<String> {
+        val out = ArrayList<String>()
+        val lens = engine.lenses.getOrNull(s.lensIndex)
+        out.add("Lens: ${lens?.label ?: "-"}  (camera id ${lens?.cameraId ?: "-"})")
+        val raw = engine.rawSize
+        val jpg = engine.jpegSize
+        out.add("RAW size: ${if (raw != null) "${raw.width} x ${raw.height}" else "-"}")
+        out.add("JPEG size: ${if (jpg != null) "${jpg.width} x ${jpg.height}" else "-"}")
+        val sz = engine.sensorSize
+        if (sz != null) out.add("Sensor: %.1f x %.1f mm".format(sz.width, sz.height))
+        if (engine.focalMm > 0) out.add("Focal length: ${engine.focalMm} mm (35mm equivalent)")
+        out.add("ISO range: ${engine.isoRange.lower} - ${engine.isoRange.upper}")
+        out.add("Shutter range: ${fmtShutter(engine.expRange.lower)} - ${fmtShutter(engine.expRange.upper)}")
+        val minF = engine.minFocusDiopter
+        out.add("Closest focus: ${if (minF > 0f) "%.0f cm".format(100f / minF) else "fixed focus"}")
+        out.add("Custom white balance: ${if (engine.manualWb) "supported" else "not supported"}")
+        out.add(
+            "Camera hardware level: " + when (engine.hwLevel) {
+                0 -> "LIMITED"
+                1 -> "FULL"
+                2 -> "LEGACY"
+                3 -> "LEVEL 3"
+                4 -> "EXTERNAL"
+                else -> "unknown"
+            }
+        )
+        out.add("Lenses with manual control: ${engine.lenses.joinToString { it.label }}")
+        out.add("Free storage: %.1f GB".format(engine.freeBytes() / (1024.0 * 1024.0 * 1024.0)))
+        return out
+    }
+
+    private fun openSettings() {
+        val dialog = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        val scroll = ScrollView(this).apply { setBackgroundColor(Color.BLACK) }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(18), dp(18), dp(40))
+        }
+        scroll.addView(box)
+        var formatChanged = false
+        var nightChanged = false
+
+        fun render() {
+            box.removeAllViews()
+
+            val head = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            head.addView(text("Settings", 22f, fg, true), lp(0, WRAP, 1f))
+            head.addView(pill("Close", false) { dialog.dismiss() })
+            box.addView(head)
+
+            box.addView(sectionTitle("Display"))
+            box.addView(toggleRow("Night red mode", "Red screen and dim brightness to protect night vision", s.night) {
+                s.night = it
+                nightChanged = true
+                s.save(this)
+                render()
+            })
+            box.addView(toggleRow("Grid overlay", "Thirds grid and centre cross on the preview", s.grid) {
+                s.grid = it
+                grid.visibility = if (it) View.VISIBLE else View.GONE
+                s.save(this)
+                render()
+            })
+            box.addView(toggleRow("Details on preview", "Lens, resolution, ISO, shutter, focus and WB at the top left", s.showInfo) {
+                s.showInfo = it
+                overlay.visibility = if (it) View.VISIBLE else View.GONE
+                s.save(this)
+                render()
+            })
+
+            box.addView(sectionTitle("Capture"))
+            box.addView(text("File format", 15f))
+            val formats = listOf("RAW (DNG)", "JPEG", "RAW + JPEG")
+            val fi = when {
+                s.raw && s.jpeg -> 2
+                s.raw -> 0
+                else -> 1
+            }
+            box.addView(choiceRow(formats, fi) {
+                if (running) {
+                    toast("Stop shooting first")
+                } else {
+                    s.raw = it != 1
+                    s.jpeg = it != 0
+                    formatChanged = true
+                    s.save(this)
+                    render()
+                }
+            })
+            box.addView(valueRow(
+                "Target name",
+                if (s.targetName.isBlank()) "Not set" else s.targetName,
+                "Added to file names and session folders, e.g. M31"
+            ) {
+                prompt("Target name (e.g. M31, Moon)", s.targetName, InputType.TYPE_CLASS_TEXT) {
+                    s.targetName = it.trim()
+                    s.save(this)
+                    render()
+                }
+            })
+            box.addView(toggleRow("Sound when finished", "Short beep when a sequence ends", s.beep) {
+                s.beep = it
+                s.save(this)
+                render()
+            })
+
+            box.addView(sectionTitle("Storage"))
+            box.addView(text("Save location", 15f))
+            val bases = listOf("Pictures", "DCIM")
+            box.addView(choiceRow(bases, bases.indexOf(s.baseDir).coerceAtLeast(0)) {
+                s.baseDir = bases[it]
+                s.save(this)
+                render()
+            })
+            box.addView(valueRow(
+                "Folder name",
+                if (s.folderName.isBlank()) "AstroCam" else s.folderName,
+                "Created inside ${s.baseDir}. You can use sub-folders like Astro/2026"
+            ) {
+                prompt("Folder name", s.folderName, InputType.TYPE_CLASS_TEXT) {
+                    s.folderName = it.trim()
+                    s.save(this)
+                    render()
+                }
+            })
+            val treeName = if (s.treeUri.isEmpty()) "Not set" else (Uri.parse(s.treeUri).lastPathSegment ?: "Selected")
+            box.addView(valueRow(
+                "Custom folder",
+                treeName,
+                "Pick any folder, even on an SD card. It replaces the location above."
+            ) {
+                val i = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                    addFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                            Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                    )
+                }
+                @Suppress("DEPRECATION")
+                startActivityForResult(i, REQ_TREE)
+            })
+            if (s.treeUri.isNotEmpty()) {
+                box.addView(pill("Clear custom folder", false) {
+                    s.treeUri = ""
+                    s.save(this)
+                    render()
+                }, lp(WRAP, WRAP, 0f, 0, dp(4), 0, dp(4)))
+            }
+            box.addView(toggleRow("Sub-folder per frame type", "light / dark / flat / bias", s.typeFolders) {
+                s.typeFolders = it
+                s.save(this)
+                render()
+            })
+            box.addView(toggleRow("New folder for each session", "Target name + date and time", s.sessionFolder) {
+                s.sessionFolder = it
+                s.save(this)
+                render()
+            })
+            box.addView(note("Files are saved to: ${pathHint()}/"))
+
+            box.addView(sectionTitle("Camera details"))
+            for (line in cameraDetails()) box.addView(text(line, 13f, fg), lp(MATCH, WRAP, 0f, 0, dp(2), 0, dp(2)))
+
+            box.addView(sectionTitle("Other"))
+            val other = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            other.addView(pill("Help and tips", false) { showHelp() }, lp(WRAP, WRAP, 0f, 0, 0, dp(8), 0))
+            other.addView(pill("Reset all settings", false) {
+                AlertDialog.Builder(this)
+                    .setTitle("Reset all settings?")
+                    .setMessage("ISO, shutter, folders and everything else go back to the defaults.")
+                    .setPositiveButton("Reset") { _, _ ->
+                        s.resetToDefaults()
+                        s.save(this)
+                        nightChanged = true
+                        formatChanged = true
+                        dialog.dismiss()
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            })
+            box.addView(other)
+        }
+
+        settingsRefresh = { render() }
+        dialog.setContentView(scroll)
+        dialog.setOnDismissListener {
+            settingsRefresh = null
+            s.save(this)
+            if (nightChanged) {
+                engineReady = false
+                opening = false
+                engine.close()
+                buildUi()
+            } else if (formatChanged) {
+                reopenCamera()
+                refreshAll()
+            } else {
+                refreshAll()
+            }
+        }
+        render()
+        dialog.show()
     }
 
     // ---------------------------------------------------------------- Shooting
@@ -977,12 +1346,14 @@ class MainActivity : Activity(), CameraEngine.Listener {
         running = false
         inFlight = false
         ui.removeCallbacksAndMessages(null)
-        setStatus(msg ?: "Done: $shotsDone frame(s) saved in Pictures/AstroCam/${s.frameType.prefix}")
+        setStatus(msg ?: "Done: $shotsDone frame(s) saved in ${pathHint()}")
         refreshAll()
-        try {
-            ToneGenerator(AudioManager.STREAM_NOTIFICATION, 70).startTone(ToneGenerator.TONE_PROP_ACK, 250)
-        } catch (e: Exception) {
-            // no sound is fine
+        if (s.beep) {
+            try {
+                ToneGenerator(AudioManager.STREAM_NOTIFICATION, 70).startTone(ToneGenerator.TONE_PROP_ACK, 250)
+            } catch (e: Exception) {
+                // no sound is fine
+            }
         }
     }
 }
